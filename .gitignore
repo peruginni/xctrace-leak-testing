@@ -1,0 +1,12 @@
+.DS_Store
+.derived-data/
+DerivedData/
+artifacts/
+build/
+xcuserdata/
+*.xcuserstate
+*.xcresult
+*.trace
+*.log
+*.mobileprovision
+*.dSYM/
