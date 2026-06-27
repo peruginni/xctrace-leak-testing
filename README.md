@@ -28,10 +28,8 @@ This post compares two checks: a quick unit test for one type and a broader UI t
 | Another object keeps the tested object alive | ✅ | ✅ |
 | A related object leaks on its own | ❌ | ✅ |
 | App wiring creates a retain cycle | ❌ | ✅ |
-| The tested user flow triggers another app leak | ❌ | ✅ |
+| User flow triggers another app leak | ❌ | ✅ |
 | Framework or system code leaks | ❌ | ✅ |
-
-_This table shows what each check can see, not what Instruments will always report._ `xctrace` may also find leaks in system frameworks, which can add some noise outside the app code.
 
 ## Option 1: Quick unit test
 
