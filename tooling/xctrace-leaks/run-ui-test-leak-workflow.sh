@@ -1,17 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ -z "${DEVELOPER_DIR:-}" && -d /Applications/Xcode.app/Contents/Developer ]]; then
+  export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
+fi
+
 LEAK_DETECTOR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CALLER_DIR="${CALLER_DIR:-$PWD}"
 
 PROJECT_PATH="${PROJECT_PATH:-}"
 WORKSPACE_PATH="${WORKSPACE_PATH:-}"
 SCHEME="${SCHEME:-}"
-DESTINATION="${DESTINATION:-platform=macOS}"
+DESTINATION="${DESTINATION:-}"
 TEST_IDENTIFIER="${TEST_IDENTIFIER:-}"
 APP_PROCESS_NAME="${APP_PROCESS_NAME:-}"
 APP_PROCESS_DEVICE_ID="${APP_PROCESS_DEVICE_ID:-}"
+APP_BUNDLE_PATH="${APP_BUNDLE_PATH:-}"
 APP_START_WAIT_SECONDS="${APP_START_WAIT_SECONDS:-5}"
+APP_ATTACH_WAIT_SECONDS="${APP_ATTACH_WAIT_SECONDS:-1}"
 RELATED_PROCESS_PATTERN="${RELATED_PROCESS_PATTERN:-$APP_PROCESS_NAME|xcodebuild|xctest|XCTest|UITests}"
 DERIVED_DATA_PATH="${DERIVED_DATA_PATH:-$CALLER_DIR/.derived-data}"
 ARTIFACTS_DIR="${ARTIFACTS_DIR:-$CALLER_DIR/artifacts}"
@@ -33,13 +39,13 @@ if [[ ! -f "$DEFAULT_XCTRACE_TEMPLATE" ]]; then
 fi
 XCTRACE_TEMPLATE="${XCTRACE_TEMPLATE:-$DEFAULT_XCTRACE_TEMPLATE}"
 XCTRACE_DEVICE="${XCTRACE_DEVICE:-}"
+XCTRACE_TIME_LIMIT="${XCTRACE_TIME_LIMIT:-45s}"
 XCTRACE_NO_PROMPT="${XCTRACE_NO_PROMPT:-1}"
 XCTRACE_NOTIFY_NAME="${XCTRACE_NOTIFY_NAME:-com.example.xctrace.ui-test.started.$$}"
 LEAKS_EXPORT_XPATH="${LEAKS_EXPORT_XPATH:-/trace-toc/run[@number=\"1\"]/tracks/track[@name=\"Leaks\"]/details/detail[@name=\"Leaks\"]}"
 RUN_LEAK_CHECK="${RUN_LEAK_CHECK:-1}"
 LEAK_CHECK_SCRIPT="${LEAK_CHECK_SCRIPT:-$LEAK_DETECTOR_DIR/check_xctrace_leaks.py}"
 RECORD_START_WAIT_SECONDS="${RECORD_START_WAIT_SECONDS:-30}"
-RECORD_WATCHDOG_SECONDS="${RECORD_WATCHDOG_SECONDS:-120}"
 TOTAL_PHASES=6
 
 print_phase() {
@@ -63,7 +69,7 @@ if [[ -z "$PROJECT_PATH" && -z "$WORKSPACE_PATH" ]]; then
   exit 2
 fi
 
-for required_variable in SCHEME APP_PROCESS_NAME; do
+for required_variable in SCHEME DESTINATION APP_PROCESS_NAME; do
   if [[ -z "${!required_variable}" ]]; then
     echo "Set $required_variable." >&2
     exit 2
@@ -84,6 +90,22 @@ if [[ -n "$WORKSPACE_PATH" ]]; then
   XCODEBUILD_CONTAINER_ARGS=(-workspace "$WORKSPACE_PATH")
 else
   XCODEBUILD_CONTAINER_ARGS=(-project "$PROJECT_PATH")
+fi
+
+XCODEBUILD_SETTING_ARGS=()
+if [[ -n "${DEVELOPMENT_TEAM:-}" ]]; then
+  XCODEBUILD_SETTING_ARGS+=(DEVELOPMENT_TEAM="$DEVELOPMENT_TEAM")
+fi
+if [[ -n "${CODE_SIGN_IDENTITY:-}" ]]; then
+  XCODEBUILD_SETTING_ARGS+=(CODE_SIGN_IDENTITY="$CODE_SIGN_IDENTITY")
+fi
+if [[ -n "${ENABLE_DEBUG_DYLIB:-}" ]]; then
+  XCODEBUILD_SETTING_ARGS+=(ENABLE_DEBUG_DYLIB="$ENABLE_DEBUG_DYLIB")
+fi
+
+XCODEBUILD_OPTION_ARGS=()
+if [[ "${ALLOW_PROVISIONING_UPDATES:-NO}" == "YES" ]]; then
+  XCODEBUILD_OPTION_ARGS+=(-allowProvisioningUpdates)
 fi
 
 TEST_FILTER_ARGS=()
@@ -188,25 +210,15 @@ wait_for_recording_start() {
 wait_for_recorder_exit() {
   local status=0
 
-  for _ in $(seq 0 "$RECORD_WATCHDOG_SECONDS"); do
-    if ! kill -0 "$RECORD_PID" >/dev/null 2>&1; then
-      if wait "$RECORD_PID"; then
-        status=0
-      else
-        status=$?
-      fi
-      RECORD_PID=""
-      return "$status"
-    fi
-
-    sleep 1
-  done
-
-  echo "xctrace did not finish after target exit timeout; terminating recorder." | tee -a "$RECORD_LOG"
-  kill "$RECORD_PID" >/dev/null 2>&1 || true
-  wait "$RECORD_PID" >/dev/null 2>&1 || true
+  # The time limit bounds this wait. Waiting also reaps an exited xctrace
+  # process; kill -0 alone reports a finished-but-unreaped process as alive.
+  if wait "$RECORD_PID"; then
+    status=0
+  else
+    status=$?
+  fi
   RECORD_PID=""
-  return 124
+  return "$status"
 }
 
 print_phase 1 "Building UI test bundle..."
@@ -215,11 +227,33 @@ if ! xcodebuild \
   -scheme "$SCHEME" \
   -destination "$DESTINATION" \
   -derivedDataPath "$DERIVED_DATA_PATH" \
+  "${TEST_FILTER_ARGS[@]}" \
+  ${XCODEBUILD_OPTION_ARGS[@]+"${XCODEBUILD_OPTION_ARGS[@]}"} \
   build-for-testing \
+  ${XCODEBUILD_SETTING_ARGS[@]+"${XCODEBUILD_SETTING_ARGS[@]}"} \
   >"$BUILD_LOG" 2>&1; then
   echo "UI test build failed. Details are in the artifacts directory." >&2
   exit 1
 fi
+
+if [[ -n "$APP_PROCESS_DEVICE_ID" ]]; then
+  if [[ -z "$APP_BUNDLE_PATH" || ! -d "$APP_BUNDLE_PATH" ]]; then
+    echo "The built iOS app was not found at APP_BUNDLE_PATH=$APP_BUNDLE_PATH" >&2
+    exit 1
+  fi
+
+  if ! xcrun devicectl device install app \
+    --device "$APP_PROCESS_DEVICE_ID" \
+    "$APP_BUNDLE_PATH" \
+    --quiet \
+    --timeout 30 \
+    >>"$BUILD_LOG" 2>&1; then
+    echo "The target app could not be installed on the iOS device." >&2
+    echo "Details are in the artifacts directory." >&2
+    exit 1
+  fi
+fi
+
 echo "UI test bundle built."
 
 pkill -x "$APP_PROCESS_NAME" >/dev/null 2>&1 || true
@@ -232,12 +266,34 @@ xcodebuild \
   -derivedDataPath "$DERIVED_DATA_PATH" \
   -parallel-testing-enabled "$PARALLEL_TESTING_ENABLED" \
   "${TEST_FILTER_ARGS[@]}" \
+  ${XCODEBUILD_OPTION_ARGS[@]+"${XCODEBUILD_OPTION_ARGS[@]}"} \
   test-without-building \
+  ${XCODEBUILD_SETTING_ARGS[@]+"${XCODEBUILD_SETTING_ARGS[@]}"} \
   >"$TEST_LOG" 2>&1 &
 TEST_PID=$!
 
 if ! wait_for_app_pid; then
   echo "Could not find the app process while the UI test was starting." >&2
+  echo "Details are in the artifacts directory." >&2
+  exit 1
+fi
+
+sleep "$APP_ATTACH_WAIT_SECONDS"
+
+if ! kill -0 "$TEST_PID" >/dev/null 2>&1; then
+  if wait "$TEST_PID"; then
+    TEST_STATUS=0
+  else
+    TEST_STATUS=$?
+  fi
+  TEST_PID=""
+  echo "The UI test ended before xctrace could attach (status $TEST_STATUS)." >&2
+  echo "Details are in the artifacts directory." >&2
+  exit "$TEST_STATUS"
+fi
+
+if [[ -z "$APP_PROCESS_DEVICE_ID" ]] && ! kill -0 "$APP_PID" >/dev/null 2>&1; then
+  echo "The app process ended before xctrace could attach." >&2
   echo "Details are in the artifacts directory." >&2
   exit 1
 fi
@@ -253,7 +309,7 @@ fi
   if [[ -n "$APP_PROCESS_DEVICE_ID" ]]; then
     echo "  device=$APP_PROCESS_DEVICE_ID pid=$APP_PID executable=$APP_PROCESS_NAME"
   else
-    ps -p "$APP_PID" -o pid= -o ppid= -o stat= -o command=
+    ps -p "$APP_PID" -o pid= -o ppid= -o stat= -o command= || true
   fi
   echo
   echo "Recording configuration:"
@@ -265,10 +321,12 @@ fi
   echo "  APP_PROCESS_NAME=$APP_PROCESS_NAME"
   echo "  APP_PROCESS_DEVICE_ID=$APP_PROCESS_DEVICE_ID"
   echo "  APP_START_WAIT_SECONDS=$APP_START_WAIT_SECONDS"
+  echo "  APP_ATTACH_WAIT_SECONDS=$APP_ATTACH_WAIT_SECONDS"
   echo "  RELATED_PROCESS_PATTERN=$RELATED_PROCESS_PATTERN"
   echo "  PARALLEL_TESTING_ENABLED=$PARALLEL_TESTING_ENABLED"
   echo "  XCTRACE_TEMPLATE=$XCTRACE_TEMPLATE"
   echo "  XCTRACE_DEVICE=$XCTRACE_DEVICE"
+  echo "  XCTRACE_TIME_LIMIT=$XCTRACE_TIME_LIMIT"
   echo "  LEAKS_EXPORT_XPATH=$LEAKS_EXPORT_XPATH"
   echo "  RUN_LEAK_CHECK=$RUN_LEAK_CHECK"
   echo "  LEAK_CHECK_SCRIPT=$LEAK_CHECK_SCRIPT"
@@ -284,6 +342,7 @@ fi
 set -- xcrun xctrace record \
   --template "$XCTRACE_TEMPLATE" \
   --attach "$APP_PID" \
+  --time-limit "$XCTRACE_TIME_LIMIT" \
   --output "$RECORDING_TRACE_PATH" \
   --notify-tracing-started "$XCTRACE_NOTIFY_NAME"
 
@@ -324,6 +383,17 @@ if wait_for_recorder_exit; then
   RECORD_STATUS=0
 else
   RECORD_STATUS=$?
+fi
+
+if [[ -n "$APP_PROCESS_DEVICE_ID" ]]; then
+  xcrun devicectl device process terminate \
+    --device "$APP_PROCESS_DEVICE_ID" \
+    --pid "$APP_PID" \
+    --quiet \
+    --timeout 10 \
+    >/dev/null 2>&1 || true
+else
+  kill "$APP_PID" >/dev/null 2>&1 || true
 fi
 
 echo "UI test exited with status $TEST_STATUS; xctrace exited with status $RECORD_STATUS."

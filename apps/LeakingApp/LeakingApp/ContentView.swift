@@ -1,6 +1,6 @@
 //
 //  ContentView.swift
-//  MemoryLeakingApp
+//  LeakingApp
 //
 //  Created for the sample project.
 //
@@ -19,7 +19,7 @@ struct ContentView: View {
                     .font(.largeTitle)
                     .fontWeight(.semibold)
 
-                Text("Open and close the leaking screen repeatedly while xctrace records the process.")
+                Text("Open and close the leaking screen repeatedly while a memory tool watches the process.")
                     .font(.body)
                     .multilineTextAlignment(.center)
                     .foregroundStyle(.secondary)
